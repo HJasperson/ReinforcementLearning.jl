@@ -1,4 +1,5 @@
-export global_norm,
+export select_last_dim
+    global_norm,
     clip_by_global_norm!,
     find_all_max,
     discount_rewards,
@@ -11,6 +12,9 @@ export global_norm,
 
 using FillArrays: Trues
 using GPUArrays
+
+select_last_dim(xs::AbstractArray{T,N}, inds) where {T,N} =
+    @views xs[ntuple(_ -> (:), N - 1)..., inds]
 
 #####
 # Zygote
