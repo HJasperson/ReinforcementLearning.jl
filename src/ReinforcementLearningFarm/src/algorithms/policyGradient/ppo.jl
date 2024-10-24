@@ -16,7 +16,7 @@ using Random
 - `λ = 0.95f0`,
 - `clip_range = 0.2f0`,
 - `max_grad_norm = 0.5f0`,
-- `n_microbatches = 4`,
+- `minibatches = 4`,
 - `n_epochs = 4`,
 - `actor_loss_weight = 1.0f0`,
 - `critic_loss_weight = 0.5f0`,
@@ -32,18 +32,20 @@ multi-dimensional action spaces, though it only supports it under the assumption
 that the dimensions are independent since the `GaussianNetwork` outputs a single
 `μ` and `σ` for each dimension which is used to simplify the calculations.
 
-n_epochs and n_microbatches are for the outer and inner gradient update loops, respectively.
+n_epochs and minibatches are for the outer and inner gradient update loops, respectively.
 device can be a cpu or gpu.
 """
-mutable struct PPOPolicy{A<:ActorCritic,E<:AbstractExplorer,D<:Flux.AbstractDevice,R} <: AbstractPolicy
+mutable struct PPOPolicy{A<:ActorCritic,E<:AbstractExplorer,F<:Flux.AbstractDevice,
+    D<:Distributions.ValueSupport,R} <: AbstractPolicy
     learner::A
     explorer::E
-    device::D
+    device::F
+    dist::D
     γ::Float32
     λ::Float32
     clip_range::Float32
     max_grad_norm::Float32
-    n_microbatches::Int
+    minibatches::Int
     n_epochs::Int
     actor_loss_weight::Float32
     critic_loss_weight::Float32
@@ -54,27 +56,28 @@ end
 function PPOPolicy(;
     learner,
     explorer,
+    dist = Distributions.Discrete,
     γ = 0.99f0,
     λ = 0.95f0,
     clip_range = 0.2f0,
     max_grad_norm = 0.5f0,
-    n_microbatches = 4,
+    minibatches = 4,
     n_epochs = 4,
     actor_loss_weight = 1.0f0,
     critic_loss_weight = 0.5f0,
     entropy_loss_weight = 0.01f0,
-    dist = Categorical,
     rng = Random.GLOBAL_RNG,
     device = Flux.get_device(learner)
 )
-    PPOPolicy{typeof(learner),dist,typeof(rng)}(
+    PPOPolicy{typeof(learner),typeof(explorer),typeof(device),dist,typeof(rng)}(
         learner,
         explorer,
+        dist,
         γ,
         λ,
         clip_range,
         max_grad_norm,
-        n_microbatches,
+        minibatches,
         n_epochs,
         actor_loss_weight,
         critic_loss_weight,
@@ -87,15 +90,67 @@ end
 Flux.@layer PPOPolicy trainable=(learner,)
 
 function RLBase.plan!(p::PPOPolicy, env::E) where {E<:AbstractEnv}
+    RLBase.plan!(p, env, p.dist)
+end
+
+function RLBase.plan!(p::PPOPolicy, env::E, ::Distributions.Continuous) where {E<:AbstractEnv}
+    # run the actor
+    μ, logσ = p.learner.actor(env |> p.device) |> cpu
+
+    # run the explorer
 
 end
 
-function RLBase.optimize!(p::PPOPolicy, ::PostActStage, trajectory::Trajectory)
+function RLBase.plan!(p::PPOPolicy, env::E, ::Distributions.Discrete) where {E<:AbstractEnv}
+    # run the actor to get prob distribution
+    dist = RLBase.prob(p, env, p.dist)
+    logprobs = log.(probs(dist))
 
+    # run the explorer
+    action = RLBase.plan!(p.explorer, logprobs)
 end
+
 
 function RLBase.prob(p::PPOPolicy, env::E) where {E<:AbstractEnv}
+    RLBase.prob(p, env, p.dist)
+end
 
+function RLBase.prob(p::PPOPolicy, env::E, ::Distributions.Continuous) where {E<:AbstractEnv}
+    
+end
+
+function RLBase.prob(p::PPOPolicy, env::E, ::Distributions.Discrete) where {E<:AbstractEnv}
+    logits = p.learner.actor(env |> p.device)
+    # todo: masking
+    probs = softmax(logits) |> cpu
+    return Categorical(probs)
+end
+
+
+function RLBase.optimize!(p::PPOPolicy, ::PostActStage, traj::Trajectory)
+    # check if it's time to optimize via the controller
+    if on_sample!(traj.controller)
+        batch = sample(traj.sampler, traj.container)    # run the sampler
+        batch_size = length(batch[:terminal])  # todo: check if this is correct
+        minibatch_size = batch_size / p.minibatches
+
+        states_plus = batch[:state] |> p.device
+        states_flatten = flatten_batch(select_last_dim(states_plus, 1:batch_size))
+        values = p.learner.critic(flatten_batch(states_plus)) |> cpu    # todo: might need to be reshaped
+        advantages = generalized_advantage_estimation(
+            batch[:reward],
+            values,
+            p.γ,
+            p.λ;
+            dims = 2,
+            terminal = batch[:terminal],
+        )
+        returns = advantages .+ values  # todo: not sure this is the correct VF loss
+
+        actions_flatten = flatten_batch(select_last_dim(batch[:action], 1:batch_size))
+        action_log_probs = select_last_dim(batch[:action_log_prob], 1:batch_size)
+
+    end
 end
 
 
@@ -183,7 +238,7 @@ function _update!(p::PPOPolicy, t::AbstractTrajectory)
 
     states_flatten = flatten_batch(select_last_dim(states_plus, 1:n))
     states_plus_values =
-        reshape(AC.critic(flatten_batch(states_plus) |> cpu), n_envs, :)
+        reshape(AC.critic(flatten_batch(states_plus)) |> cpu, n_envs, :)
     advantages = generalized_advantage_estimation(
         t[:reward],
         states_plus_values,
